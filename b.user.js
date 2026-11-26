@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NULLS JUMP Auto-Player
 // @namespace    nulls-jump-bot
-// @version      2.7b
-// @description  Auto-player for nulls.world/jump — reads live game state, steers with real key events. Trial: 30 runs, no Memory Cards.
+// @version      2.7c
+// @description  Auto-player for nulls.world/jump — reads live game state, steers via the game's own touch/key input (auto-fallback). Trial: 30 runs, no Memory Cards.
 // @author       Efendi
 // @match        https://nulls.world/jump
 // @match        https://nulls.world/jump/*
@@ -83,6 +83,29 @@
 //  - blue (mover) targets penalised while Feather Fall is active (fall timing differs -> prediction off)
 //  - stuck recovery STEERS OFF the platform instead of releasing keys (releasing never ends a bounce loop)
 //  - snapshots (seed, input log, revive step, steps, bounty) at death for offline replay verification
+//  - MOBILE INPUT FIX (v2.7c, 26 Nov ~17:05 WITA — live bug: on Firefox Android the
+//    character only auto-jumped, never steered). Root cause: the game has THREE input
+//    paths and the bot only used one. (1) Keyboard: window keydown/keyup -> keys.l/r,
+//    but key() returns early when `state.fair && state.entered` (fair-play not yet
+//    agreed) or !entered — on Efendi's logged-in phone the keyboard path can be dead
+//    while the game still plays. (2) Touch/pointer: pDown/pMove/pUp on the stage set
+//    g.touch (a Map pointerId->dir); dir() reads keys, then touch, then tilt. pDown
+//    does NOT check entered/fair — it is the mobile input path (ctrl='touch' when
+//    matchMedia('(pointer: coarse)') matches). (3) Tilt. The replay log is recorded
+//    by dirQ(), which reads dir() every step — so ANY path that changes keys/touch
+//    is recorded identically and replays valid. v2.7c therefore steers through FOUR
+//    interchangeable methods and self-checks them: 'touch' (set g.touch directly —
+//    exactly what pDown does, primary on coarse/mobile), 'keys' (set g.keys.l/r
+//    directly — exactly what key() does), 'pointer' (real PointerEvents on the
+//    canvas/stage, the finger equivalent), 'keybd' (synthetic KeyboardEvents on
+//    window — the old method, proven on desktop). A self-check compares the game's
+//    actual dir() against the wanted direction; if they disagree for >2.5s the bot
+//    cycles to the next method by itself. A small on-screen overlay (pointer-events:
+//    none) shows phase/score/x/target/input-method/steer-OK so the player can SEE
+//    whether the bot is steering. maxRuns/useContinue unchanged (30 / false).
+//    Also: continue/give-up and air-jump now call the game's own methods directly
+//    (g.giveUp()/g.reboot()/g.airJump()) instead of dispatching Space/Escape keys,
+//    so they work even when the key() gate is active.
 (() => {
   'use strict';
   if (window.__NULLS_BOT__) { console.log('[BOT] already installed'); return; }
@@ -170,8 +193,13 @@
   const B = {
     g: null, on: false, maxRuns: 10, runsDone: 0, useContinue: false, localTest: false,
     runs: [], log: [],
-    held: 0,            // -1, 0, 1 currently held
+    held: 0,            // -1, 0, 1 currently held (desired direction)
+    applied: 0,         // direction last applied via events (v2.7c, for release)
     lastFlip: 0,
+    inputMethod: 'keybd', // v2.7c current steering method: touch | keys | pointer | keybd
+    inputFailAt: 0,     // when the current method started disagreeing with g.dir()
+    inputNote: '',      // last input-method switch reason (shown in the overlay)
+    overlayEl: null, overlayAt: 0, _stageEl: null,
     target: null,       // committed landing platform
     targetV: 0,         // v-score of the committed target (v2.7: upgrades compare v, not y)
     decisions: [],      // per-bounce decision log for this run (v2.7 diagnostics)
@@ -188,19 +216,108 @@
 
   function say(...a) { const m = '[BOT] ' + a.join(' '); B.log.push(m); console.log(m); }
 
+  // ---- v2.7c input methods -------------------------------------------------
+  // The game records the replay log in dirQ(), which reads dir() every step —
+  // dir() reads keys, then touch, then tilt. So ANY method that changes keys or
+  // touch is recorded identically and replays valid; the log cannot tell HOW the
+  // direction was set, only what it was. Methods (in cycle order):
+  //   'touch'   — set g.touch directly (a virtual finger). Exactly what the game's
+  //               own pDown does. Primary on coarse/mobile; bypasses the key()
+  //               fair/entered gate entirely (pDown never checks those).
+  //   'keys'    — set g.keys.l/r directly. Exactly what key() does, minus the gate.
+  //   'pointer' — real PointerEvents on the canvas/stage (finger equivalent).
+  //   'keybd'   — synthetic KeyboardEvents on window (old method, desktop-proven).
+  const VPTR = 999999;   // virtual pointer id for 'touch' (real pointer ids are small)
+  const PPTR = 888888;   // virtual pointer id for 'pointer'
+  const INPUT_METHODS = ['touch', 'keys', 'pointer', 'keybd'];
+  function stageEl() {
+    // The element pDown/pMove/pUp are attached to (via React props on the stage);
+    // events dispatched on the canvas bubble up to it. Cache it.
+    if (B._stageEl && document.contains(B._stageEl)) return B._stageEl;
+    const cv = document.querySelector('canvas');
+    B._stageEl = cv || document.body;
+    return B._stageEl;
+  }
+  function ptrEvt(type, side) {
+    // Dispatch a PointerEvent on the stage at the left (side -1) or right (+1) half.
+    const el = stageEl();
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width * (side < 0 ? 0.25 : 0.75);
+    const y = r.top + r.height * 0.5;
+    el.dispatchEvent(new PointerEvent(type, {
+      pointerId: PPTR, clientX: x, clientY: y,
+      bubbles: true, cancelable: true, isPrimary: true, pointerType: 'touch',
+    }));
+  }
+  function applyInput(dir) {
+    // Apply the desired direction via the CURRENT method. Direct-state methods are
+    // idempotent and re-applied on every call (guards against onBlur clearing touch
+    // / keys). Event methods act only on change (tracked via B.applied).
+    const g = B.g;
+    if (!g) return;
+    const m = B.inputMethod;
+    if (m === 'touch') {
+      if (dir === 0) g.touch.delete(VPTR);
+      else g.touch.set(VPTR, dir);
+      B.applied = dir;
+    } else if (m === 'keys') {
+      g.keys.l = dir === -1;
+      g.keys.r = dir === 1;
+      B.applied = dir;
+    } else if (m === 'pointer') {
+      if (dir === B.applied) return;
+      if (B.applied !== 0) ptrEvt('pointerup', B.applied);
+      if (dir !== 0) ptrEvt('pointerdown', dir);
+      B.applied = dir;
+    } else { // 'keybd'
+      if (dir === B.applied) return;
+      const up = (key) => window.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+      const dn = (key) => window.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+      if (B.applied === -1) up('ArrowLeft');
+      if (B.applied === 1) up('ArrowRight');
+      if (dir === -1) dn('ArrowLeft');
+      if (dir === 1) dn('ArrowRight');
+      B.applied = dir;
+    }
+  }
+  function releaseInput() {
+    // Release whatever the CURRENT method holds (switching methods / stopping).
+    // A stuck key/finger from the old method would override the new one (dir()
+    // reads keys before touch), so this must run before every switch.
+    const g = B.g;
+    const m = B.inputMethod;
+    if (g) {
+      if (m === 'touch') g.touch.delete(VPTR);
+      else if (m === 'keys') { g.keys.l = false; g.keys.r = false; }
+      else if (m === 'pointer') { if (B.applied !== 0) ptrEvt('pointerup', B.applied); }
+      else {
+        if (B.applied === -1) window.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowLeft', bubbles: true }));
+        if (B.applied === 1) window.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowRight', bubbles: true }));
+      }
+    }
+    B.held = 0; B.applied = 0;
+  }
+  function cycleInputMethod(reason) {
+    // Switch to the next method (self-check: the current one isn't reaching the game).
+    const i = INPUT_METHODS.indexOf(B.inputMethod);
+    const next = INPUT_METHODS[(i + 1) % INPUT_METHODS.length];
+    releaseInput();
+    B.inputMethod = next;
+    B.inputFailAt = 0;
+    B.inputNote = reason + ' -> ' + next;
+    say('INPUT method switched to ' + next + ' (' + reason + ')');
+  }
   function setDir(dir) {
-    // dispatch real key events so the game's own listener records the input
+    // The single steering entry point (steerToDx / steerToLanding / giveUp).
+    // Re-applying the same direction is a no-op for event methods and a cheap
+    // idempotent re-set for direct methods (so a cleared touch/keys state is
+    // restored on the next frame).
     const now = performance.now();
-    if (dir === B.held) return;
-    if (now - B.lastFlip < MIN_HOLD_MS) return; // one key change at most every 50ms (v2.6)
-    const up = (key) => window.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
-    const dn = (key) => window.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
-    if (B.held === -1) up('ArrowLeft');
-    if (B.held === 1) up('ArrowRight');
-    if (dir === -1) dn('ArrowLeft');
-    if (dir === 1) dn('ArrowRight');
+    if (dir === B.held) { applyInput(dir); return; }
+    if (now - B.lastFlip < MIN_HOLD_MS) return; // one change at most every 50ms (v2.6)
     B.held = dir;
     B.lastFlip = now;
+    applyInput(dir);
   }
   // hysteresis steering toward a horizontal offset dx (px, wrapped)
   function steerToDx(dx) {
@@ -225,6 +342,44 @@
     else setDir(s);
   }
   function releaseKeys() { setDir(0); }
+
+  // ---- v2.7c on-screen overlay --------------------------------------------
+  // A tiny status box (pointer-events:none, so it never blocks the game's own
+  // touch input) so the player can SEE whether the bot is steering. Without it
+  // a dead input method is invisible — the character just auto-jumps.
+  function createOverlay() {
+    if (B.overlayEl || !document.body) return;
+    const d = document.createElement('div');
+    d.id = 'nulls-bot-overlay';
+    d.style.cssText = 'position:fixed;top:8px;left:8px;z-index:999999;pointer-events:none;' +
+      'background:rgba(0,0,0,.68);color:#f4f1e6;font:11px/1.5 monospace,monospace;' +
+      'padding:6px 8px;border-radius:6px;max-width:78vw;white-space:pre-wrap;' +
+      'border:1px solid rgba(244,241,230,.35);';
+    d.textContent = 'NULLS BOT v2.7c — starting…';
+    document.body.appendChild(d);
+    B.overlayEl = d;
+  }
+  function updateOverlay() {
+    const el = B.overlayEl;
+    if (!el) return;
+    const now = performance.now();
+    if (now - B.overlayAt < 250) return; // throttle to ~4Hz
+    B.overlayAt = now;
+    const g = B.g;
+    if (!g) { el.textContent = 'NULLS BOT v2.7c\nGAME NOT FOUND — bot idle'; return; }
+    const ph = g.state.phase;
+    const want = B.held, got = (typeof g.dir === 'function') ? g.dir() : '?';
+    const steerOk = !B.on ? '—' : (want === 0 ? 'idle' : (got === want ? 'OK ✓' : 'FAIL ✗'));
+    const tgt = B.target ? (B.target.type + ' y=' + Math.round(B.target.y)) : '—';
+    const best = B.runs.length ? Math.max(...B.runs.map(r => r.score)) : 0;
+    el.textContent =
+      'NULLS BOT v2.7c ' + (B.on ? '[ON]' : '[OFF]') + ' input=' + B.inputMethod + ' steer=' + steerOk + '\n' +
+      'phase=' + ph + ' score=' + g.score + ' runs=' + B.runsDone + '/' + B.maxRuns + ' best=' + best + '\n' +
+      'x=' + Math.round(g.p.x) + ' y=' + Math.round(g.p.y) + ' vx=' + Math.round(g.p.vx) +
+      ' want=' + want + ' got=' + got + '\n' +
+      'target=' + tgt + ' entered=' + !!g.state.entered + ' fair=' + !!g.state.fair +
+      ' ctrl=' + (g.state.ctrl || '?') + (B.inputNote ? '\n' + B.inputNote : '');
+  }
 
   // Bounce velocity FROM a platform: spring 1855 (JUMP*1.75), shoes 1431 (JUMP*1.35, only
   // when shoes are ALREADY active — a shoes orb on pl itself is collected AFTER this
@@ -425,8 +580,7 @@
       const below = g.plats.filter(q => landable(q) && q.y < p.y && q.y > p.y - 500);
       const near = below.some(q => Math.abs(wrapDx(q.x - p.x)) < q.w / 2 + 40);
       if (!near && p.y < g.cam + 220) {
-        window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
-        setTimeout(() => window.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', bubbles: true })), 60);
+        g.airJump(); // v2.7c: direct call (the Space key is gated by fair/entered)
         say('AIRJUMP at y=' + Math.round(p.y) + ' score=' + g.score);
       }
     }
@@ -649,14 +803,14 @@
         say('CONTINUE OFFER score=' + sc + ' cards=' + cards + ' useContinue=' + B.useContinue);
         setTimeout(() => {
           if (!B.g || B.g.state.phase !== 'cont') return;
+          // v2.7c: call the game's own methods directly (Space/Escape keys are
+          // gated by fair/entered in key() — the bot would be stuck on this screen).
           if (B.useContinue && cards > 0 && sc >= 500) {
             say('REBOOT (continue) at score=' + sc);
-            window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
-            setTimeout(() => window.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', bubbles: true })), 60);
+            B.g.reboot();
           } else {
             say('GIVE UP continue (cards=' + cards + ', score=' + sc + ')');
-            window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-            setTimeout(() => window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', bubbles: true })), 60);
+            B.g.giveUp();
           }
         }, 800);
       }
@@ -679,11 +833,26 @@
         say('DIAG ' + JSON.stringify(B.diag()));
       }
       steer(g);
+      // v2.7c self-check: is the wanted direction actually reaching the game?
+      // g.dir() is a pure read (dirQ would mutate the log — never call it here).
+      // If the game keeps seeing 0 (or the wrong way) while the bot holds a
+      // direction, the current input method is dead — cycle to the next one.
+      if (B.held !== 0 && !g.dead) {
+        const got = g.dir();
+        if (got === B.held) { B.inputFailAt = 0; }
+        else {
+          if (!B.inputFailAt) B.inputFailAt = now;
+          else if (now - B.inputFailAt > 2500) {
+            cycleInputMethod('want ' + B.held + ' got ' + got);
+          }
+        }
+      } else { B.inputFailAt = 0; }
       B.prevLand = g.p.land;
     } else if (ph !== 'play') {
       if (B.held !== 0) releaseKeys();
       B.prevLand = g.p.land;
     }
+    updateOverlay();
   }
 
   B.start = function (opts) {
@@ -699,6 +868,15 @@
       B.g.setState({ handle: 'LOCALTEST' });
       say('localTest: handle set to LOCALTEST (offline runs, NOT saved)');
     }
+    // v2.7c: pick the input method for this device. Coarse pointer (touch) ->
+    // 'touch' (the game's own mobile path); otherwise 'keybd' (desktop-proven).
+    // opts.input forces a method (offline tests).
+    const coarse = !!(B.g.coarse || (B.g.state && B.g.state.coarse));
+    B.inputMethod = opts.input || (coarse ? 'touch' : 'keybd');
+    B.applied = 0; B.held = 0; B.inputFailAt = 0; B.inputNote = '';
+    createOverlay();
+    say('input method=' + B.inputMethod + ' (coarse=' + coarse + ' ctrl=' + B.g.state.ctrl +
+      ' entered=' + !!B.g.state.entered + ' fair=' + !!B.g.state.fair + ')');
     B.on = true;
     lastPhase = B.g.state.phase;
     // ENTER FIRST: the game's key handler ignores ArrowLeft/ArrowRight entirely while
@@ -731,8 +909,9 @@
     };
   };
   // Test hook: pure decision functions, for offline unit tests (no gameplay effect).
-  B._test = { landNeed, moverX, chainAbove, chain1, pickTarget, tLand, predXFree, predX, bounceVy, RISE, wrapDx, landable };
-  console.log('[BOT] v2.7b installed. window.__NULLS_BOT__.start({maxRuns:10, localTest:true})');
+  B._test = { landNeed, moverX, chainAbove, chain1, pickTarget, tLand, predXFree, predX, bounceVy, RISE, wrapDx, landable,
+    setInput: m => { B.inputMethod = m; B.applied = 0; }, inputMethods: INPUT_METHODS, applyInput, cycleInputMethod, releaseInput };
+  console.log('[BOT] v2.7c installed. window.__NULLS_BOT__.start({maxRuns:10, localTest:true})');
 })();
 
 // Autostart (trial): wait until the game shows the player as logged in, then start 30 runs once.
